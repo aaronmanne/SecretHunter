@@ -1,0 +1,39 @@
+[package]
+name = "secrethunter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Offline, project-aware secret and sensitive-data scanner"
+publish = false
+
+[dependencies]
+aho-corasick = "1.1"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
+flate2 = "1.1"
+getrandom = "0.3"
+hex = "0.4"
+hmac = "0.12"
+pem = "3.0"
+rayon = "1.10"
+regex = "1.11"
+schemars = "1.0"
+rustix = { version = "1.0", features = ["fs", "process"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3.19"
+time = { version = "0.3", features = ["parsing", "formatting", "macros"] }
+toml = "0.8"
+url = "2.5"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[[bin]]
+name = "secrethunter"
+path = "src/main.rs"

@@ -1,0 +1,7 @@
+/target/
+/dist/
+*.tmp
+.idea/
+*.log
+.DS_Store
+
