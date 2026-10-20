@@ -220,34 +220,61 @@ of erroring:
 
 - A missing `TARGET` is prompted for (defaults to `.`).
 - Unless `--llm-verify` or `--no-llm-verify` is given, you are **always** asked
-  whether to send findings to a local Ollama instance for LLM verification (see
-  below).
-- If you opt in and `--llm-model` is omitted, you are shown the models currently
-  installed in Ollama and asked to pick one.
+  whether to send findings to a local LLM for verification (see below).
+- If you opt in and `--llm-backend` is omitted, both [Ollama](https://ollama.com)
+  and [LM Studio](https://lmstudio.ai) are probed: if only one is running, it is
+  used automatically (with a note to say which); if both are running, you are
+  asked which one to use; if neither is running, you are told no local LLM was
+  detected and verification is skipped (hosted/online models are not supported).
+- If `--llm-model` is omitted, you are shown the models currently installed on
+  the selected backend and asked to pick one.
 - If `--llm-rule` is omitted, you are shown each rule ID that matched (with its
-  finding count) and asked which ones to send to the LLM.
+  finding count) and asked which ones to send to the LLM. **Rule IDs you do not
+  select are dropped from the report entirely**, not just skipped for LLM
+  analysis — select everything if you only want to narrow what gets a verdict
+  without shrinking the report.
 
 In any non-interactive context (CI, pipes, redirected output, or scripted use) none
-of this is ever asked: a missing `TARGET` is an error, and LLM verification stays
-off unless `--llm-verify` is given explicitly (in which case every rule ID is
-included unless narrowed with `--llm-rule`).
+of this is ever asked: a missing `TARGET` is an error, LLM verification stays off
+unless `--llm-verify` is given explicitly, and if both backends happen to be
+running you must pass `--llm-backend` to pick one (an ambiguous pair is otherwise
+reported and verification is skipped). When explicit, every rule ID is included,
+and nothing is dropped, unless narrowed with `--llm-rule`.
 
 ### Optional local LLM verification
 
 `--llm-verify` (or the interactive prompt) sends each selected finding's matched
-value, rule, and description to a local [Ollama](https://ollama.com) instance
-(`--llm-endpoint`, default `http://localhost:11434`) for a fast, deterministic
-viability verdict — `likely_real`, `likely_false_positive`, or `uncertain` — with a
-one-sentence explanation. This is the only network call SecretHunter ever makes
-beyond an explicitly requested GitHub clone, it never leaves the local machine by
-default, and it never blocks or fails the scan: if Ollama is unreachable or has no
-models installed, verification is skipped with a warning and the report is still
-written. The verdict and explanation, when present, are attached to the finding and
-shown in every report format.
+value, rule, and description to a locally running LLM server — either
+[Ollama](https://ollama.com) (default `http://localhost:11434`, override with
+`--ollama-endpoint`) or [LM Studio](https://lmstudio.ai) (default
+`http://localhost:1234`, override with `--lmstudio-endpoint`) — for a fast
+viability verdict, one of **REAL SECRET**, **LIKELY FALSE POSITIVE**, **FALSE
+POSITIVE**, or **UNDETERMINED**, with a short 2-3 sentence explanation. A verbose
+"thinking"/reasoning model's chain-of-thought is automatically trimmed down to
+just its concluding sentences so the report stays readable. Pass `--llm-backend
+ollama` or `--llm-backend lmstudio` to pick one explicitly instead of
+auto-detecting; without it, SecretHunter probes both and uses whichever single one
+is running, asks you to choose if both are, and skips with a clear message if
+neither is (hosted/online models are not supported — this is a local-only
+feature). This is the only network call SecretHunter ever makes beyond an
+explicitly requested GitHub clone, it never leaves the local machine by default,
+and it never blocks or fails the scan: an unreachable/model-less backend just
+skips verification with a warning and the report is still written. The verdict,
+model, backend, and explanation, when present, are attached to the finding and
+shown in every report format — and in HTML, a "Filter by LLM verdict" row of
+checkboxes (including "No LLM analysis" for anything not sent to the LLM) lets you
+narrow the report down to just the categories you care about, e.g. hiding
+everything the LLM already flagged as a false positive. Progress (`--progress`
+other than `off`) prints a status line per finding sent to the LLM and a final
+`analyzed`/`failed` summary to stderr, since this step runs one sequential request
+per finding and can take a while on CPU-only hardware or with many findings;
+Ctrl-C stops it early and still writes a report with whatever
+verdicts were completed.
 
 ```sh
 # Explicit, fully non-interactive
-secrethunter scan . --llm-verify --llm-model llama3.1 --llm-rule generic-secret
+secrethunter scan . --llm-verify --llm-backend ollama --llm-model llama3.1 \
+  --llm-rule generic-secret
 
 # Never ask about it, even on a terminal
 secrethunter scan . --no-llm-verify

@@ -26,16 +26,32 @@ pub fn ask_target() -> Result<String, String> {
 /// this and is handled by the caller before reaching here.
 pub fn ask_llm_verify() -> bool {
     Confirm::with_theme(&ColorfulTheme::default())
-        .with_prompt("Verify findings with a local Ollama LLM for fast false-positive triage?")
+        .with_prompt("Verify findings with a local LLM (Ollama or LM Studio) for fast false-positive triage?")
         .default(false)
         .interact()
         .unwrap_or(false)
 }
 
+/// Lets the user pick between locally detected LLM backends when more than
+/// one is running. `options` is `(display_name, model_count)`.
+pub fn ask_backend(options: &[(&str, usize)]) -> Option<usize> {
+    let items: Vec<String> = options
+        .iter()
+        .map(|(name, n)| format!("{name} ({n} model{})", if *n == 1 { "" } else { "s" }))
+        .collect();
+    Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Multiple local LLM services are running; which one should verify findings?")
+        .items(&items)
+        .default(0)
+        .interact_opt()
+        .ok()
+        .flatten()
+}
+
 /// Lets the user pick one of the locally installed Ollama models.
 pub fn ask_model(models: &[String]) -> Option<String> {
     let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select an Ollama model for triage")
+        .with_prompt("Select a model for triage")
         .items(models)
         .default(0)
         .interact_opt()

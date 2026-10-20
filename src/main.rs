@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use secrethunter::{
     config, detect,
-    finding::{Finding, Identity},
+    finding::Identity,
     interactive, llm,
     progress::{Mode as ProgressMode, Progress},
     report,
@@ -24,7 +24,7 @@ EXAMPLES:
   secrethunter scan .
 
   # Run with no arguments at all on a terminal: you are prompted for the
-  # target, and asked whether to verify findings with a local Ollama LLM
+  # target, and asked whether to verify findings with a local LLM
   secrethunter scan
 
   # Scan a GitHub repository (public, or private with --github-token-env)
@@ -42,8 +42,9 @@ EXAMPLES:
   # Exclude build output without writing a policy file
   secrethunter scan . --exclude '**/target/**' --exclude '**/node_modules/**'
 
-  # Non-interactive LLM triage of just the generic-secret rule's findings
-  secrethunter scan . --llm-verify --llm-model llama3.1 --llm-rule generic-secret
+  # Non-interactive LLM triage via a specific backend and model
+  secrethunter scan . --llm-verify --llm-backend ollama --llm-model llama3.1 \
+    --llm-rule generic-secret
 
   # Never ask about or run LLM verification, even on a terminal
   secrethunter scan . --no-llm-verify
@@ -61,20 +62,28 @@ EXIT CODES:
 INTERACTIVE PROMPTS (only when both stdin and stdout are a terminal):
   - A missing TARGET is prompted for.
   - Unless --llm-verify or --no-llm-verify is given, you are always asked
-    whether to send findings to a local Ollama instance for fast,
+    whether to send findings to a local LLM (Ollama or LM Studio) for fast,
     offline-only viability triage.
-  - If you opt in and --llm-model is omitted, you are asked to pick a model
-    from what Ollama currently has installed.
+  - If you opt in and --llm-backend is omitted, both Ollama and LM Studio are
+    probed: if only one is running, it is used automatically; if both are
+    running, you are asked which one to use; if neither is running, LLM
+    verification is skipped (online/hosted models are not supported).
+  - If --llm-model is omitted, you are asked to pick a model from what the
+    selected backend currently has installed.
   - If --llm-rule is omitted, you are asked which rule IDs' findings to send.
+    Rule IDs you do not select are dropped from the final report entirely,
+    not just skipped for LLM analysis.
   - Outside a terminal (CI, pipes, redirected output), none of the above is
     ever asked: a missing TARGET is an error, and LLM verification is off
     unless explicitly requested with --llm-verify (and, if given, every rule
-    ID is included unless --llm-rule narrows it).
-  - If Ollama is unreachable or has no models installed, LLM verification is
-    skipped with a warning; the scan and report are never blocked by it.
+    ID is included, and nothing is dropped, unless --llm-rule narrows it; if
+    both backends are running, --llm-backend must choose one).
+  - If no local LLM is detected, or the selected one has no models, LLM
+    verification is skipped with a warning; the scan and report are never
+    blocked by it.
 
 No telemetry, no network access beyond an explicitly requested GitHub clone or
-a user-opted-in local Ollama call, and no credential verification: everything
+a user-opted-in local LLM call, and no credential verification: everything
 else runs locally. The report includes the raw matched value of every finding
 (for fast triage) and, when requested, the LLM's verdict \u{2014} handle and
 store it as sensitively as the secrets themselves.";
@@ -256,11 +265,11 @@ struct ScanArgs {
     #[arg(long = "exclude", value_name = "GLOB")]
     exclude: Vec<String>,
 
-    /// Send findings to a local Ollama instance for fast, offline viability
-    /// triage after the scan completes (never a network call beyond the
-    /// given --llm-endpoint). On an interactive terminal you are always
-    /// asked about this if neither flag is given. Conflicts with
-    /// --no-llm-verify.
+    /// Send findings to a local LLM (Ollama or LM Studio) for fast, offline
+    /// viability triage after the scan completes (never a network call
+    /// beyond the detected/given local endpoint; hosted/online models are
+    /// not supported). On an interactive terminal you are always asked
+    /// about this if neither flag is given. Conflicts with --no-llm-verify.
     #[arg(long, conflicts_with = "no_llm_verify")]
     llm_verify: bool,
 
@@ -269,21 +278,36 @@ struct ScanArgs {
     #[arg(long)]
     no_llm_verify: bool,
 
-    /// Ollama model to use for LLM verification (e.g. "llama3.1"). If
-    /// omitted on an interactive terminal, you are asked to pick one from
-    /// the models currently available at --llm-endpoint.
-    #[arg(long, value_name = "MODEL", requires = "llm_verify")]
+    /// Which local LLM backend to use. If omitted, both Ollama and LM Studio
+    /// are probed: if only one is running, it is used automatically; if
+    /// both are running, you are asked to pick one on an interactive
+    /// terminal (an error otherwise); if neither is running, LLM
+    /// verification is skipped with a warning.
+    #[arg(long, value_parser = ["ollama", "lmstudio"], value_name = "BACKEND")]
+    llm_backend: Option<String>,
+
+    /// Model to use for LLM verification (e.g. "llama3.1"). If omitted on an
+    /// interactive terminal, you are asked to pick one from the models
+    /// currently available on the selected backend.
+    #[arg(long, value_name = "MODEL")]
     llm_model: Option<String>,
 
-    /// Base URL of the local Ollama server used for LLM verification.
+    /// Base URL of the local Ollama server, used when Ollama is the selected
+    /// backend.
     #[arg(long, value_name = "URL", default_value = "http://localhost:11434")]
-    llm_endpoint: String,
+    ollama_endpoint: String,
+
+    /// Base URL of the local LM Studio server, used when LM Studio is the
+    /// selected backend.
+    #[arg(long, value_name = "URL", default_value = "http://localhost:1234")]
+    lmstudio_endpoint: String,
 
     /// Rule ID to include in LLM verification (repeatable). If omitted on an
     /// interactive terminal, you are asked to choose from the rule IDs that
     /// actually matched. If omitted non-interactively, every rule ID is
-    /// included.
-    #[arg(long = "llm-rule", value_name = "RULE_ID", requires = "llm_verify")]
+    /// included. Rule IDs not included are dropped from the report entirely
+    /// (not just skipped for LLM analysis) once LLM verification runs.
+    #[arg(long = "llm-rule", value_name = "RULE_ID")]
     llm_rules: Vec<String>,
 }
 
@@ -339,17 +363,24 @@ fn default_report_path(format: &str) -> Result<PathBuf, String> {
 
 /// Runs optional, local-only LLM triage over the findings selected by the
 /// user (interactively or via flags) and attaches each verdict to its
-/// `Finding`. Never fails the scan: an unreachable Ollama endpoint, an empty
-/// model list, or a failed individual call all just skip with a warning.
+/// `Finding`. Never fails the scan: no local LLM detected, an empty model
+/// list, or a failed individual call all just skip with a warning. Rule
+/// categories the user does not select are dropped from the report
+/// entirely, not just left unanalyzed.
 #[allow(clippy::too_many_arguments)]
 fn run_llm_verification(
     result: &mut Report,
     llm_verify: bool,
     no_llm_verify: bool,
+    llm_backend: Option<String>,
     llm_model: Option<String>,
-    endpoint: &str,
+    ollama_endpoint: &str,
+    lmstudio_endpoint: &str,
     llm_rules: Vec<String>,
     warn: bool,
+    cancelled: &AtomicBool,
+    fail_on_severity: &str,
+    fail_on_confidence: &str,
 ) {
     if result.findings.is_empty() || no_llm_verify {
         return;
@@ -360,20 +391,109 @@ fn run_llm_verification(
     } else if interactive::interactive() {
         interactive::ask_llm_verify()
     } else {
+        if warn {
+            eprintln!(
+                "SecretHunter: non-interactive session; skipping the LLM verification prompt \
+                 (pass --llm-verify to run it anyway)."
+            );
+        }
         false
     };
     if !wants_llm {
         return;
     }
-    let models = llm::list_models(endpoint);
-    if models.is_empty() {
-        if warn {
-            eprintln!(
-                "SecretHunter: no Ollama models found at {endpoint}; skipping LLM verification."
-            );
+
+    let endpoint_for = |backend: llm::Backend| match backend {
+        llm::Backend::Ollama => ollama_endpoint,
+        llm::Backend::LmStudio => lmstudio_endpoint,
+    };
+
+    let (backend, endpoint, models) = match llm_backend.as_deref().map(llm::Backend::parse) {
+        Some(Some(backend)) => {
+            let endpoint = endpoint_for(backend);
+            match llm::probe(backend, endpoint).filter(|m| !m.is_empty()) {
+                Some(models) => (backend, endpoint, models),
+                None => {
+                    if warn {
+                        eprintln!(
+                            "SecretHunter: {} is not reachable (or has no models) at {endpoint}; \
+                             skipping LLM verification.",
+                            backend.display_name()
+                        );
+                    }
+                    return;
+                }
+            }
         }
-        return;
-    }
+        Some(None) => {
+            if warn {
+                eprintln!("SecretHunter: unknown --llm-backend value; skipping LLM verification.");
+            }
+            return;
+        }
+        None => {
+            let ollama = llm::probe(llm::Backend::Ollama, ollama_endpoint)
+                .filter(|m| !m.is_empty())
+                .map(|models| (llm::Backend::Ollama, ollama_endpoint, models));
+            let lmstudio = llm::probe(llm::Backend::LmStudio, lmstudio_endpoint)
+                .filter(|m| !m.is_empty())
+                .map(|models| (llm::Backend::LmStudio, lmstudio_endpoint, models));
+            match (ollama, lmstudio) {
+                (Some(ollama), Some(lmstudio)) => {
+                    let options = [
+                        (ollama.0.display_name(), ollama.2.len()),
+                        (lmstudio.0.display_name(), lmstudio.2.len()),
+                    ];
+                    if interactive::interactive() {
+                        match interactive::ask_backend(&options) {
+                            Some(0) => ollama,
+                            Some(_) => lmstudio,
+                            None => {
+                                if warn {
+                                    eprintln!(
+                                        "SecretHunter: no backend selected; skipping LLM \
+                                         verification."
+                                    );
+                                }
+                                return;
+                            }
+                        }
+                    } else {
+                        if warn {
+                            eprintln!(
+                                "SecretHunter: both Ollama and LM Studio are running; pass \
+                                 --llm-backend ollama or --llm-backend lmstudio to choose one \
+                                 non-interactively. Skipping LLM verification."
+                            );
+                        }
+                        return;
+                    }
+                }
+                (Some(found), None) | (None, Some(found)) => {
+                    if warn {
+                        eprintln!(
+                            "SecretHunter: detected {} running at {}; using it for LLM \
+                             verification.",
+                            found.0.display_name(),
+                            found.1
+                        );
+                    }
+                    found
+                }
+                (None, None) => {
+                    if warn {
+                        eprintln!(
+                            "SecretHunter: no local LLM detected (checked Ollama at {ollama_endpoint} \
+                             and LM Studio at {lmstudio_endpoint}); online models are not yet \
+                             supported. Skipping LLM verification."
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+    };
+
     let model = match llm_model.filter(|m| models.contains(m)) {
         Some(model) => model,
         None if interactive::interactive() => match interactive::ask_model(&models) {
@@ -388,8 +508,9 @@ fn run_llm_verification(
         None => {
             if warn {
                 eprintln!(
-                    "SecretHunter: --llm-model was not given or is not installed in Ollama; \
-                     skipping LLM verification."
+                    "SecretHunter: --llm-model was not given or is not installed in {}; \
+                     skipping LLM verification.",
+                    backend.display_name()
                 );
             }
             return;
@@ -412,36 +533,65 @@ fn run_llm_verification(
     } else {
         counts.iter().map(|(rule, _)| rule.clone()).collect()
     };
-    if selected_rules.is_empty() {
+
+    // Categories the user did not select are dropped from the report
+    // entirely, not just excluded from LLM analysis.
+    let before = result.findings.len();
+    result
+        .findings
+        .retain(|f| selected_rules.contains(&f.rule_id));
+    if result.findings.len() != before {
+        report::recompute_aggregates(result, fail_on_severity, fail_on_confidence);
+    }
+    if result.findings.is_empty() {
+        if warn {
+            eprintln!(
+                "SecretHunter: no rule categories were selected for LLM verification; the \
+                 report contains no findings."
+            );
+        }
         return;
     }
 
-    let targets: Vec<usize> = result
-        .findings
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| selected_rules.contains(&f.rule_id))
-        .map(|(i, _)| i)
-        .collect();
-    for (done, index) in targets.iter().enumerate() {
+    let total = result.findings.len();
+    if warn {
+        eprintln!(
+            "SecretHunter: sending {total} finding(s) to {} model {model} for triage; this can \
+             take a while on CPU-only hardware...",
+            backend.display_name()
+        );
+    }
+    let mut analyzed = 0;
+    let mut failed = 0;
+    for (done, finding) in result.findings.iter_mut().enumerate() {
+        if cancelled.load(Ordering::Relaxed) {
+            if warn {
+                eprintln!("SecretHunter: LLM verification interrupted; keeping what was done.");
+            }
+            break;
+        }
         if warn {
-            eprint!(
-                "\rSecretHunter: LLM verification {}/{}...",
+            eprintln!(
+                "SecretHunter: LLM verification {}/{total} ({})...",
                 done + 1,
-                targets.len()
+                finding.rule_id
             );
         }
-        let finding: &Finding = &result.findings[*index];
-        match llm::analyze(endpoint, &model, finding) {
-            Ok(analysis) => result.findings[*index].llm = Some(analysis),
-            Err(message) if warn => {
-                eprintln!("\nSecretHunter: LLM verification failed for one finding: {message}");
+        match llm::analyze(backend, endpoint, &model, finding) {
+            Ok(analysis) => {
+                finding.llm = Some(analysis);
+                analyzed += 1;
             }
-            Err(_) => {}
+            Err(message) => {
+                failed += 1;
+                if warn {
+                    eprintln!("SecretHunter: LLM verification failed for one finding: {message}");
+                }
+            }
         }
     }
-    if warn && !targets.is_empty() {
-        eprintln!();
+    if warn {
+        eprintln!("SecretHunter: LLM verification done: {analyzed} analyzed, {failed} failed.");
     }
 }
 
@@ -568,8 +718,11 @@ fn execute(cli: Cli) -> Result<i32, String> {
             let handler_flag = Arc::clone(&cancelled);
             ctrlc::set_handler(move || handler_flag.store(true, Ordering::Relaxed))
                 .map_err(|_| "Cannot register cancellation handler.")?;
+            let llm_cancelled = Arc::clone(&cancelled);
             let run = Run::new(config.scan.timeout_seconds, cancelled);
             let format = config.output.format.clone();
+            let fail_on_severity = config.policy.fail_on_severity.clone();
+            let fail_on_confidence = config.policy.fail_on_confidence.clone();
             let repository_id = match &target {
                 source::Target::Directory(root) => root.to_string_lossy().into_owned(),
                 source::Target::GitHub(url) => url.strip_suffix(".git").unwrap_or(url).into(),
@@ -586,10 +739,15 @@ fn execute(cli: Cli) -> Result<i32, String> {
                 &mut result,
                 args.llm_verify,
                 args.no_llm_verify,
+                args.llm_backend,
                 args.llm_model,
-                &args.llm_endpoint,
+                &args.ollama_endpoint,
+                &args.lmstudio_endpoint,
                 args.llm_rules,
                 args.progress != "off",
+                &llm_cancelled,
+                &fail_on_severity,
+                &fail_on_confidence,
             );
             let bytes = report::render(&result, &format, args.audit_ignores)?;
             if let Some(output) = output {

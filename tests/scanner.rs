@@ -2061,8 +2061,8 @@ fn llm_verify_flags_are_non_interactive_and_never_block_the_scan() {
         .unwrap();
     assert_eq!(result.status.code(), Some(1));
 
-    // --llm-verify with an unreachable endpoint skips with a warning instead
-    // of failing the scan or blocking on a prompt.
+    // --llm-verify with an unreachable, explicitly-forced backend skips with
+    // a warning instead of failing the scan or blocking on a prompt.
     let result = Command::new(env!("CARGO_BIN_EXE_secrethunter"))
         .current_dir(temp.path())
         .args([
@@ -2071,9 +2071,11 @@ fn llm_verify_flags_are_non_interactive_and_never_block_the_scan() {
             "--key-file",
             key.to_str().unwrap(),
             "--llm-verify",
+            "--llm-backend",
+            "ollama",
             "--llm-model",
             "fixture-model",
-            "--llm-endpoint",
+            "--ollama-endpoint",
             "http://127.0.0.1:1",
             "--format",
             "json",
@@ -2088,7 +2090,8 @@ fn llm_verify_flags_are_non_interactive_and_never_block_the_scan() {
     let report: Value = serde_json::from_slice(&result.stdout).unwrap();
     assert!(report["findings"][0]["llm"].is_null());
 
-    // --llm-model without --llm-verify is rejected by clap up front.
+    // Neither backend reachable and none forced: a clear "no local LLM
+    // detected" warning, still never blocking or failing the scan.
     let result = Command::new(env!("CARGO_BIN_EXE_secrethunter"))
         .current_dir(temp.path())
         .args([
@@ -2096,12 +2099,184 @@ fn llm_verify_flags_are_non_interactive_and_never_block_the_scan() {
             ".",
             "--key-file",
             key.to_str().unwrap(),
-            "--llm-model",
-            "fixture-model",
+            "--llm-verify",
+            "--ollama-endpoint",
+            "http://127.0.0.1:1",
+            "--lmstudio-endpoint",
+            "http://127.0.0.1:1",
+            "--format",
+            "json",
+            "--output",
+            "-",
         ])
         .output()
         .unwrap();
-    assert_eq!(result.status.code(), Some(2));
+    assert_eq!(result.status.code(), Some(1));
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    assert!(stderr.contains("no local LLM detected"), "{stderr}");
+    assert!(
+        stderr.contains("online models are not yet supported"),
+        "{stderr}"
+    );
+}
+
+/// Minimal mock Ollama server: answers `/api/tags` with one model and
+/// `/api/generate` with a canned verdict, enough to exercise the real CLI
+/// flow end-to-end without a real Ollama install.
+fn mock_ollama() -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                continue;
+            }
+            let mut content_length = 0usize;
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap_or(0) == 0 || header.trim().is_empty() {
+                    break;
+                }
+                if let Some(value) = header.to_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            std::io::Read::read_exact(&mut reader, &mut body).ok();
+            let body = if request_line.contains("/api/tags") {
+                r#"{"models":[{"name":"fixture-model"}]}"#
+            } else {
+                r#"{"response":"LIKELY_FALSE_POSITIVE: synthetic fixture value"}"#
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+        }
+    });
+    (addr, handle)
+}
+
+#[test]
+fn llm_rule_selection_drops_unselected_categories_from_the_report() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("app.env"),
+        format!("password={PASSWORD}\n"),
+    )
+    .unwrap();
+    fs::write(temp.path().join("customer.txt"), "CUST-12345678").unwrap();
+    let policy = temp.path().join("secrethunter.toml");
+    fs::write(
+        &policy,
+        r###"version = 1
+[ruleset]
+builtins = true
+[[rules]]
+id = "customer-id"
+description = "Synthetic customer ID"
+category = "sensitive_data"
+severity = "high"
+confidence = "medium"
+regex = '\bCUST-[0-9]{8}\b'
+secret_group = 0
+positive_examples = ["CUST-12345678"]
+negative_examples = ["CUST-short"]
+"###,
+    )
+    .unwrap();
+    let key = cli_key(temp.path());
+    let (addr, _server) = mock_ollama();
+    let result = Command::new(env!("CARGO_BIN_EXE_secrethunter"))
+        .current_dir(temp.path())
+        .args([
+            "scan",
+            ".",
+            "--config",
+            policy.to_str().unwrap(),
+            "--key-file",
+            key.to_str().unwrap(),
+            "--llm-verify",
+            "--llm-backend",
+            "ollama",
+            "--llm-model",
+            "fixture-model",
+            "--ollama-endpoint",
+            &format!("http://{addr}"),
+            "--llm-rule",
+            "customer-id",
+            "--format",
+            "json",
+            "--output",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    assert!(stderr.contains("analyzed"), "{stderr}");
+    let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert!(
+        findings.iter().all(|f| f["rule_id"] == "customer-id"),
+        "categories not selected for LLM triage must be dropped from the report: {report}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["llm"]["verdict"] == "likely_false_positive"),
+        "{report}"
+    );
+}
+
+#[test]
+fn html_report_is_filterable_by_llm_verdict() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("app.env"),
+        format!("password={PASSWORD}\n"),
+    )
+    .unwrap();
+    let key = cli_key(temp.path());
+    let (addr, _server) = mock_ollama();
+    let result = Command::new(env!("CARGO_BIN_EXE_secrethunter"))
+        .current_dir(temp.path())
+        .args([
+            "scan",
+            ".",
+            "--key-file",
+            key.to_str().unwrap(),
+            "--llm-verify",
+            "--llm-backend",
+            "ollama",
+            "--llm-model",
+            "fixture-model",
+            "--ollama-endpoint",
+            &format!("http://{addr}"),
+            "--format",
+            "html",
+            "--output",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    let html = String::from_utf8(result.stdout).unwrap();
+    assert!(
+        html.contains("data-llm=\"likely_false_positive\""),
+        "the finding's verdict must be attached as a filterable attribute: {html}"
+    );
+    assert!(html.contains("Filter by LLM verdict"), "{html}");
+    assert!(
+        html.contains("class=\"sh-llm-check\" value=\"likely_false_positive\""),
+        "{html}"
+    );
+    assert!(html.contains("LIKELY FALSE POSITIVE"), "{html}");
 }
 
 #[test]

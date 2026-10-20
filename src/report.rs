@@ -110,6 +110,41 @@ impl Masker {
     }
 }
 
+/// Recomputes `active_occurrences`, `suppressed_occurrences`, and `exit_code`
+/// after findings have been removed from an already-finished report (for
+/// example, dropping rule categories the user excluded from LLM triage).
+/// `interrupted`/incomplete-coverage exit codes (130/2) always take
+/// precedence over the finding-driven success/failure codes (0/1).
+pub fn recompute_aggregates(report: &mut Report, fail_on_severity: &str, fail_on_confidence: &str) {
+    let mut active = 0;
+    let mut suppressed = 0;
+    let mut fail = false;
+    for finding in &report.findings {
+        for o in &finding.occurrences {
+            if o.suppressions.is_empty() {
+                active += 1;
+                fail |= crate::config::severity_rank(&finding.severity)
+                    >= crate::config::severity_rank(fail_on_severity)
+                    && crate::config::confidence_rank(&finding.confidence)
+                        >= crate::config::confidence_rank(fail_on_confidence);
+            } else {
+                suppressed += 1;
+            }
+        }
+    }
+    report.active_occurrences = active;
+    report.suppressed_occurrences = suppressed;
+    report.exit_code = if report.interrupted {
+        130
+    } else if !report.coverage.complete {
+        2
+    } else if fail {
+        1
+    } else {
+        0
+    };
+}
+
 /// Masks detected values in target- and policy-derived metadata. Scanner-generated
 /// reasons are fixed text and are only control-character sanitized.
 pub fn redact_metadata(report: &mut Report, values: &[String]) -> Result<(), String> {
@@ -288,8 +323,11 @@ pub fn render(report: &Report, format: &str, audit: bool) -> Result<Vec<u8>, Str
                 }
                 if let Some(llm) = &finding.llm {
                     out.push_str(&format!(
-                        "  LLM ({}): {} - {}\n",
-                        llm.model, llm.verdict, llm.explanation
+                        "  LLM ({} / {}): {} - {}\n",
+                        llm.backend,
+                        llm.model,
+                        crate::finding::LlmAnalysis::verdict_label(&llm.verdict),
+                        llm.explanation
                     ));
                 }
                 out.push_str(&format!("  Remediation: {}\n", finding.remediation));

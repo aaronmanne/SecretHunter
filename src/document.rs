@@ -3,7 +3,7 @@
 //! validated `url`/`file_url` fields and the canonical repository URL.
 
 use crate::{
-    finding::{Finding, Occurrence},
+    finding::{Finding, LlmAnalysis, Occurrence},
     report::{Report, coverage_groups, display_path, exit_meaning},
 };
 use std::{collections::BTreeMap, fmt::Write};
@@ -216,9 +216,10 @@ pub fn markdown(report: &Report) -> String {
         if let Some(llm) = &finding.llm {
             let _ = writeln!(
                 out,
-                "- **LLM analysis** ({}): {} \u{2014} {}",
+                "- **LLM analysis** ({} / {}): {} \u{2014} {}",
+                md(&llm.backend),
                 md(&llm.model),
-                md(&llm.verdict),
+                md(LlmAnalysis::verdict_label(&llm.verdict)),
                 md(&llm.explanation)
             );
         }
@@ -365,6 +366,16 @@ fn a(text: &str, url: Option<&str>) -> String {
     }
 }
 
+/// Badge color for an `LlmAnalysis.verdict` value.
+fn llm_badge_class(verdict: &str) -> &'static str {
+    match verdict {
+        "real_secret" => "bad",
+        "likely_false_positive" => "medium",
+        "false_positive" => "ok",
+        _ => "other",
+    }
+}
+
 const STYLE: &str = r#"
 :root{--bg:#fff;--fg:#1f2328;--muted:#59636e;--line:#d1d9e0;--card:#f6f8fa;--link:#0969da;
 --critical:#82071e;--high:#cf222e;--medium:#9a6700;--low:#0969da;--ok:#1a7f37;--bad:#cf222e}
@@ -400,6 +411,8 @@ color:var(--fg);cursor:pointer;font-size:13px}
 .toolbar button:hover{background:var(--line)}.stats{display:flex;flex-wrap:wrap;gap:16px;margin:12px 0}
 .stat{border:1px solid var(--line);border-radius:8px;padding:8px 14px;background:var(--card);min-width:110px}
 .stat .n{font-size:1.5em;font-weight:700;display:block}.stat .l{color:var(--muted);font-size:12px;text-transform:uppercase}
+.llm-filter{gap:16px 10px}.llm-filter label{display:flex;gap:5px;align-items:center;font-size:13px;cursor:pointer;
+white-space:nowrap}
 "#;
 
 /// Inline only; no external resources are fetched and no data beyond what this page
@@ -417,13 +430,24 @@ const SCRIPT: &str = r#"
   });
   var input = document.getElementById('sh-search');
   var countEl = document.getElementById('sh-search-count');
-  if (!input) return;
+  var llmChecks = all('.sh-llm-check');
   var items = all('.searchable');
+  if (!input && llmChecks.length === 0) return;
+  function checkedLlm(){
+    var set = {};
+    llmChecks.forEach(function(c){ if (c.checked) set[c.value] = true; });
+    return set;
+  }
   function apply(){
-    var q = input.value.trim().toLowerCase();
+    var q = input ? input.value.trim().toLowerCase() : '';
+    var llm = checkedLlm();
     var shown = 0;
     items.forEach(function(el){
-      var match = !q || el.textContent.toLowerCase().indexOf(q) !== -1;
+      var textMatch = !q || el.textContent.toLowerCase().indexOf(q) !== -1;
+      var isFinding = el.classList.contains('finding');
+      var verdict = el.getAttribute('data-llm') || 'none';
+      var llmMatch = !isFinding || llmChecks.length === 0 || llm[verdict];
+      var match = textMatch && llmMatch;
       el.classList.toggle('sh-hidden', !match);
       if (match) {
         shown++;
@@ -435,12 +459,13 @@ const SCRIPT: &str = r#"
       }
     });
     if (countEl) {
-      countEl.textContent = q
+      countEl.textContent = (q || llmChecks.length)
         ? (shown + ' of ' + items.length + ' match' + (items.length === 1 ? '' : 'es'))
         : '';
     }
   }
-  input.addEventListener('input', apply);
+  if (input) input.addEventListener('input', apply);
+  llmChecks.forEach(function(c){ c.addEventListener('change', apply); });
   apply();
 })();
 "#;
@@ -546,6 +571,41 @@ aria-label=\"Search this report\"><span id=\"sh-search-count\" class=\"muted mon
 <button type=\"button\" id=\"sh-collapse\">Collapse all</button></div>"
     );
 
+    if report.findings.iter().any(|f| f.llm.is_some()) {
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for finding in &report.findings {
+            let key = finding.llm.as_ref().map_or("none", |l| l.verdict.as_str());
+            *counts.entry(key).or_default() += 1;
+        }
+        let _ = write!(
+            out,
+            "<div class=\"toolbar llm-filter\"><span class=\"muted\">Filter by LLM verdict:</span>"
+        );
+        for verdict in [
+            "real_secret",
+            "likely_false_positive",
+            "false_positive",
+            "undetermined",
+            "none",
+        ] {
+            let Some(n) = counts.get(verdict) else {
+                continue;
+            };
+            let label = if verdict == "none" {
+                "No LLM analysis"
+            } else {
+                LlmAnalysis::verdict_label(verdict)
+            };
+            let _ = write!(
+                out,
+                "<label><input type=\"checkbox\" class=\"sh-llm-check\" value=\"{}\" checked> {} ({n})</label>",
+                html_escape(verdict),
+                html_escape(label)
+            );
+        }
+        let _ = write!(out, "</div>");
+    }
+
     if !report.findings.is_empty() {
         let _ = write!(
             out,
@@ -598,9 +658,14 @@ aria-label=\"Search this report\"><span id=\"sh-search-count\" class=\"muted mon
         } else {
             "other"
         };
+        let llm_attr = finding
+            .llm
+            .as_ref()
+            .map(|l| format!(" data-llm=\"{}\"", html_escape(&l.verdict)))
+            .unwrap_or_default();
         let _ = write!(
             out,
-            "<details class=\"finding searchable {severity}\" id=\"finding-{}\"><summary>\
+            "<details class=\"finding searchable {severity}\"{llm_attr} id=\"finding-{}\"><summary>\
 <span class=\"badge b-{severity}\">{severity}</span> {}. <code>{}</code> \u{2014} {}</summary>\
 <div class=\"muted\">Confidence {} \u{b7} {} \u{b7} {} \u{b7} verification {} \u{b7} evidence {}</div>\
 <p><strong>Remediation:</strong> {}</p>\
@@ -620,15 +685,12 @@ aria-label=\"Search this report\"><span id=\"sh-search-count\" class=\"muted mon
         if let Some(llm) = &finding.llm {
             let _ = write!(
                 out,
-                "<p><strong>LLM analysis</strong> (<code>{}</code>): \
+                "<p><strong>LLM analysis</strong> (<code>{} / {}</code>): \
 <span class=\"badge b-{}\">{}</span> {}</p>",
+                html_escape(&llm.backend),
                 html_escape(&llm.model),
-                match llm.verdict.as_str() {
-                    "likely_real" => "bad",
-                    "likely_false_positive" => "ok",
-                    _ => "other",
-                },
-                html_escape(&llm.verdict),
+                llm_badge_class(&llm.verdict),
+                LlmAnalysis::verdict_label(&llm.verdict),
                 html_escape(&llm.explanation)
             );
         }

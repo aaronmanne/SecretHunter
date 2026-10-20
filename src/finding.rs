@@ -67,10 +67,26 @@ pub struct Finding {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LlmAnalysis {
+    /// Display name of the local backend used, e.g. "Ollama" or "LM Studio".
+    pub backend: String,
     pub model: String,
-    /// One of `likely_real`, `likely_false_positive`, or `uncertain`.
+    /// One of `real_secret`, `likely_false_positive`, `false_positive`, or
+    /// `undetermined`.
     pub verdict: String,
     pub explanation: String,
+}
+
+impl LlmAnalysis {
+    /// Human-readable label for `verdict`, as shown in every report format
+    /// and used as the report's LLM-verdict filter categories.
+    pub fn verdict_label(verdict: &str) -> &'static str {
+        match verdict {
+            "real_secret" => "REAL SECRET",
+            "likely_false_positive" => "LIKELY FALSE POSITIVE",
+            "false_positive" => "FALSE POSITIVE",
+            _ => "UNDETERMINED",
+        }
+    }
 }
 
 pub struct Identity {
