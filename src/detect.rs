@@ -1,17 +1,24 @@
 use crate::config::{Config, Rule, glob};
-use rayon::prelude::*;
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use std::collections::HashMap;
 
+/// Detection is sequential per content view; the scanner parallelizes across records
+/// so small views do not pay thread-dispatch overhead.
 pub struct Detector {
     pub rules: Vec<CompiledRule>,
-    pool: rayon::ThreadPool,
+    prefilter: Option<RegexSet>,
 }
 
 pub struct CompiledRule {
     pub spec: Rule,
     regex: Regex,
     pub paths: Vec<Regex>,
+    /// Built-in assignment rules ignore punctuation-only captures such as `:`.
+    require_alphanumeric: bool,
+    /// Extra minimum entropy (bits/char) derived from `scan.sensitivity`, applied in
+    /// addition to any rule-specified `entropy_min`. `None` for precise/signature
+    /// rules that should never be entropy-filtered.
+    sensitivity_floor: Option<f64>,
 }
 
 pub struct Candidate {
@@ -22,61 +29,84 @@ pub struct Candidate {
     pub evidence: Vec<String>,
 }
 
+/// Built-in rules broad enough to match arbitrary code (any `token = ...`
+/// assignment, any value after `Password=`) rather than a specific provider
+/// signature. Only these are scaled by `scan.sensitivity`; AWS keys, GitHub
+/// tokens, private keys, and similar fixed-format signatures are never affected.
+const NOISY_RULES: [&str; 4] = [
+    "generic-secret",
+    "generic-secret-double-quoted",
+    "generic-secret-single-quoted",
+    "connection-password",
+];
+
+/// Maps a 0 (fewest findings) .. 10 (most findings) dial to a minimum required
+/// Shannon entropy (bits/character) for noisy rules: 0 bits at sensitivity 10
+/// (no extra filtering) up to 4.0 bits at sensitivity 0.
+pub fn sensitivity_floor(sensitivity: u8) -> f64 {
+    f64::from(10 - sensitivity.min(10)) * 0.4
+}
+
 impl Detector {
     pub fn new(config: &Config) -> Result<Self, String> {
-        let specs = builtin_rules()
+        let floor = sensitivity_floor(config.scan.sensitivity);
+        let builtins = builtin_rules()
             .into_iter()
             .filter(|r| config.ruleset.builtins && !config.ruleset.disabled.contains(&r.id))
-            .chain(config.rules.clone());
-        let rules = specs.map(CompiledRule::new).collect::<Result<_, _>>()?;
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(config.scan.workers)
-            .build()
-            .map_err(|_| "Cannot initialize bounded detector workers.".to_string())?;
-        Ok(Self { rules, pool })
+            .map(|spec| {
+                let noisy = NOISY_RULES.contains(&spec.id.as_str());
+                CompiledRule::new(spec).map(|mut rule| {
+                    rule.require_alphanumeric = true;
+                    rule.sensitivity_floor = noisy.then_some(floor);
+                    rule
+                })
+            });
+        let custom = config.rules.iter().cloned().map(CompiledRule::new);
+        let rules: Vec<CompiledRule> = builtins.chain(custom).collect::<Result<_, _>>()?;
+        // One linear-time pass selects candidate rules. Very large custom rule sets fall
+        // back to running every rule if the combined automaton exceeds regex limits.
+        let prefilter = RegexSet::new(rules.iter().map(|rule| rule.spec.regex.as_str())).ok();
+        Ok(Self { rules, prefilter })
     }
 
-    pub fn candidates(&self, text: &str, limit: usize, run: &crate::scan::Run) -> Vec<Candidate> {
-        self.pool.install(|| {
-            self.rules
-                .par_iter()
-                .enumerate()
-                .filter(|_| !run.stopped())
-                .map(|(index, rule)| {
-                    rule.matches_limited(text, limit)
-                        .into_iter()
-                        .map(move |(start, end, value)| {
-                            let mut evidence = vec!["signature_match".into()];
-                            if !rule.spec.keywords.is_empty() {
-                                evidence.push("keyword_match".into());
-                            }
-                            if !rule.spec.context.any_of.is_empty() {
-                                evidence.push("context_match".into());
-                            }
-                            if rule.spec.entropy_min.is_some() {
-                                evidence.push("entropy_threshold".into());
-                            }
-                            evidence.extend(
-                                rule.spec
-                                    .validators
-                                    .iter()
-                                    .map(|v| format!("local_{v}_valid")),
-                            );
-                            Candidate {
-                                rule: index,
-                                start,
-                                end,
-                                value,
-                                evidence,
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .reduce(Vec::new, |mut left, right| {
-                    left.extend(right.into_iter().take(limit.saturating_sub(left.len())));
-                    left
-                })
-        })
+    pub fn candidates(&self, text: &str, limit: usize) -> Vec<Candidate> {
+        let matched: Vec<usize> = match &self.prefilter {
+            Some(set) => set.matches(text).into_iter().collect(),
+            None => (0..self.rules.len()).collect(),
+        };
+        let mut out = Vec::new();
+        for index in matched {
+            if out.len() >= limit {
+                break;
+            }
+            let rule = &self.rules[index];
+            for (start, end, value) in rule.matches_limited(text, limit - out.len()) {
+                let mut evidence = vec!["signature_match".into()];
+                if !rule.spec.keywords.is_empty() {
+                    evidence.push("keyword_match".into());
+                }
+                if !rule.spec.context.any_of.is_empty() {
+                    evidence.push("context_match".into());
+                }
+                if rule.spec.entropy_min.is_some() {
+                    evidence.push("entropy_threshold".into());
+                }
+                evidence.extend(
+                    rule.spec
+                        .validators
+                        .iter()
+                        .map(|v| format!("local_{v}_valid")),
+                );
+                out.push(Candidate {
+                    rule: index,
+                    start,
+                    end,
+                    value,
+                    evidence,
+                });
+            }
+        }
+        out
     }
 }
 
@@ -88,7 +118,13 @@ impl CompiledRule {
             .iter()
             .map(|p| glob(p))
             .collect::<Result<_, _>>()?;
-        Ok(Self { spec, regex, paths })
+        Ok(Self {
+            spec,
+            regex,
+            paths,
+            require_alphanumeric: false,
+            sensitivity_floor: None,
+        })
     }
 
     pub fn matches(&self, text: &str) -> Vec<(usize, usize, String)> {
@@ -108,7 +144,10 @@ impl CompiledRule {
             .filter_map(|caps| {
                 let whole = caps.get(0)?;
                 let secret = caps.get(self.spec.secret_group)?;
-                if secret.is_empty() {
+                if secret.is_empty()
+                    || (self.require_alphanumeric
+                        && !secret.as_str().bytes().any(|b| b.is_ascii_alphanumeric()))
+                {
                     return None;
                 }
                 if needs_window {
@@ -153,6 +192,12 @@ impl CompiledRule {
                 if self
                     .spec
                     .entropy_min
+                    .is_some_and(|min| entropy(secret.as_str()) < min)
+                {
+                    return None;
+                }
+                if self
+                    .sensitivity_floor
                     .is_some_and(|min| entropy(secret.as_str()) < min)
                 {
                     return None;
@@ -283,7 +328,7 @@ pub fn builtin_rules() -> Vec<Rule> {
             "Secret-bearing assignment",
             "high",
             "medium",
-            r#"(?im)(?:["']?(?:password|passwd|pwd|secret|client_secret|api_key|access_token|auth_token|token)["']?)[ \t]*[:=][ \t]*([^\s"'`,;}{\r\n]+)"#,
+            r#"(?im)(?:["']?(?:password|passwd|pwd|secret|client_secret|api_key|access_token|auth_token|token)["']?)[ \t]*[:=][ \t]*([^\s"'`,;}{()<>\[\]\r\n]+)"#,
             1,
         ),
         (
@@ -337,7 +382,8 @@ pub fn builtin_rules() -> Vec<Rule> {
     ];
     items.into_iter().map(|(id, description, severity, confidence, regex, secret_group)| Rule {
         id: id.into(), description: description.into(), category: if id == "payment-card" { "sensitive_data" } else { "credential" }.into(),
-        severity: severity.into(), confidence: confidence.into(), regex: regex.into(), secret_group,
+        // ASCII word boundaries keep built-ins on the fast DFA path for non-ASCII content.
+        severity: severity.into(), confidence: confidence.into(), regex: regex.replace(r"\b", r"(?-u:\b)"), secret_group,
         paths: Vec::new(), keywords: Vec::new(), context: Default::default(), entropy_min: None,
         validators: if id == "payment-card" { vec!["luhn".into()] } else { Vec::new() },
         positive_examples: Vec::new(), negative_examples: Vec::new(),

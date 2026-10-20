@@ -18,6 +18,9 @@ pub struct Occurrence {
     pub tag: Option<String>,
     pub ref_name: Option<String>,
     pub blob: Option<String>,
+    /// Commit author/committer time (Unix seconds), when known; used to show
+    /// only the most recent occurrence of a secret by default in reports.
+    pub commit_time: Option<i64>,
     pub byte_start: usize,
     pub byte_end: usize,
     pub line_start: Option<usize>,
@@ -26,6 +29,10 @@ pub struct Occurrence {
     pub location_mapping: String,
     pub matched_path_level: Option<usize>,
     pub suppressions: Vec<SuppressionAudit>,
+    /// GitHub commit/file/tag page, when the repository is hosted on GitHub.
+    pub url: Option<String>,
+    /// Local `file://` link for working-tree occurrences.
+    pub file_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -53,7 +60,17 @@ pub struct Finding {
     pub remediation: String,
     pub value: String,
     pub lifecycle: String,
+    /// Offline, local-only LLM triage of `value`'s viability, when requested.
+    pub llm: Option<LlmAnalysis>,
     pub occurrences: Vec<Occurrence>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LlmAnalysis {
+    pub model: String,
+    /// One of `likely_real`, `likely_false_positive`, or `uncertain`.
+    pub verdict: String,
+    pub explanation: String,
 }
 
 pub struct Identity {

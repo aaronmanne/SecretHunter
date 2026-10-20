@@ -23,5 +23,8 @@ fi
 
 mkdir -p dist
 cp "$BINARY" dist/secrethunter
+cp "$BINARY" ~/.local/bin/secrethunter
 chmod 755 dist/secrethunter
+chmod 755 ~/.local/bin/secrethunter
+
 printf '%s\n' "Built $ROOT/dist/secrethunter"

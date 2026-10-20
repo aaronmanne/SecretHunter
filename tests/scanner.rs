@@ -120,12 +120,53 @@ fn scans_hidden_ignored_low_entropy_and_redacts_every_report() {
     for format in ["terminal", "json", "sarif"] {
         let bytes = report::render(&result, format, true).unwrap();
         let text = String::from_utf8(bytes).unwrap();
-        assert!(!text.contains(PASSWORD));
-        assert!(!text.contains("pwd=cat"));
-        assert!(text.contains("[REDACTED]"));
+        // Values are now intentionally shown in the report for fast triage.
+        assert!(text.contains(PASSWORD), "{format}");
         if format != "terminal" {
             serde_json::from_str::<Value>(&text).unwrap();
         }
+    }
+}
+
+#[test]
+fn occurrences_are_ordered_most_recent_first_and_show_the_real_value() {
+    let temp = repo();
+    fs::write(
+        temp.path().join("app.env"),
+        format!("password={PASSWORD}\n"),
+    )
+    .unwrap();
+    commit(temp.path(), "first");
+    fs::write(
+        temp.path().join("app.env"),
+        format!("password={PASSWORD}\nother=1\n"),
+    )
+    .unwrap();
+    commit(temp.path(), "second");
+    let result = scan(temp.path());
+    let finding = result
+        .findings
+        .iter()
+        .find(|f| f.value == PASSWORD)
+        .expect("the real matched value is stored on the finding");
+    assert!(
+        finding.occurrences.len() >= 3,
+        "expect working tree + two historical commits"
+    );
+    // The working-tree occurrence (always the most current state) must sort
+    // before every historical commit occurrence.
+    assert_eq!(finding.occurrences[0].source, "working_tree");
+    let commit_times: Vec<_> = finding.occurrences[1..]
+        .iter()
+        .map(|o| o.commit_time.unwrap_or(i64::MIN))
+        .collect();
+    assert!(
+        commit_times.windows(2).all(|w| w[0] >= w[1]),
+        "historical occurrences must be sorted newest-first: {commit_times:?}"
+    );
+    for format in ["terminal", "json", "markdown", "html"] {
+        let text = String::from_utf8(report::render(&result, format, true).unwrap()).unwrap();
+        assert!(text.contains(PASSWORD), "{format} must show the real value");
     }
 }
 
@@ -571,12 +612,37 @@ fn unsupported_binary_limits_unsafe_members_and_symlinks_are_honest() {
     )
     .unwrap();
     let result = scan_config(temp.path(), custom_config(""));
-    assert_eq!(result.exit_code, 2);
+    assert_eq!(
+        result.exit_code, 1,
+        "binary strings are a limitation by default"
+    );
     assert_eq!(result.active_occurrences, 1);
     assert_eq!(result.findings[0].occurrences[0].line_start, None);
+    assert_eq!(
+        result.findings[0].occurrences[0].location_mapping,
+        "binary_string_bytes"
+    );
+    assert!(
+        result
+            .coverage
+            .entries
+            .iter()
+            .any(|e| e.status == "limitation" && e.reason == secrethunter::extract::BINARY_STRINGS)
+    );
+    let mut strict = custom_config("");
+    strict.scan.strict_coverage = true;
+    assert_eq!(scan_config(temp.path(), strict).exit_code, 2);
     let mut limits = custom_config("");
     limits.scan.max_file_bytes = 4;
-    assert_eq!(scan_config(temp.path(), limits).exit_code, 2);
+    assert_eq!(
+        scan_config(temp.path(), limits).exit_code,
+        0,
+        "oversized files are a limitation by default, not a hard failure"
+    );
+    let mut strict_limits = custom_config("");
+    strict_limits.scan.max_file_bytes = 4;
+    strict_limits.scan.strict_coverage = true;
+    assert_eq!(scan_config(temp.path(), strict_limits).exit_code, 2);
     fs::remove_file(temp.path().join("binary.pdf")).unwrap();
     write_zip(
         &temp.path().join("unsafe.zip"),
@@ -751,7 +817,7 @@ fn private_keys_reports_and_cli_exit_codes() {
     assert!(result.stdout.is_empty());
     let bytes = fs::read(&output).unwrap();
     let text = String::from_utf8(bytes).unwrap();
-    assert!(!text.contains(PASSWORD));
+    assert!(text.contains(PASSWORD), "value must be shown for triage");
     let report: Value = serde_json::from_str(&text).unwrap();
     assert!(report["active_occurrences"].as_u64().unwrap() >= 1);
     assert!(report["findings"].as_array().unwrap().iter().all(|f| {
@@ -790,7 +856,7 @@ fn quoted_passwords_keep_the_complete_exact_value() {
             .any(|f| f.rule_id == "generic-secret-single-quoted")
     );
     assert!(
-        !String::from_utf8(report::render(&result, "json", true).unwrap())
+        String::from_utf8(report::render(&result, "json", true).unwrap())
             .unwrap()
             .contains(value)
     );
@@ -820,7 +886,7 @@ fn provider_signatures_detect_synthetic_formats() {
     for (id, value) in fixtures {
         assert!(result.findings.iter().any(|f| f.rule_id == id), "{id}");
         assert!(
-            !String::from_utf8(report::render(&result, "json", true).unwrap())
+            String::from_utf8(report::render(&result, "json", true).unwrap())
                 .unwrap()
                 .contains(&value)
         );
@@ -849,9 +915,11 @@ expires = "2099-12-31"
 "#
     ));
     let result = scan_config(temp.path(), config);
+    // History records the commit that introduced each path/blob; the shared blob is
+    // read once but suppression is reevaluated for each path and commit.
     assert_eq!(result.suppressed_occurrences, 1);
-    assert_eq!(result.active_occurrences, 4);
-    assert!(result.coverage.cached_records >= 2);
+    assert_eq!(result.active_occurrences, 3);
+    assert_eq!(result.coverage.cached_records, 1);
     assert_eq!(result.findings[0].lifecycle, "present_in_current_tree");
 }
 
@@ -897,7 +965,7 @@ fn record_finding_and_decode_limits_never_return_clean_success() {
 }
 
 #[test]
-fn ascii_documents_are_partial_and_untrusted_metadata_is_masked() {
+fn text_documents_are_complete_and_untrusted_metadata_is_masked() {
     let temp = TempDir::new().unwrap();
     fs::write(
         temp.path().join("CUST-12345678\n!.pdf"),
@@ -907,12 +975,29 @@ fn ascii_documents_are_partial_and_untrusted_metadata_is_masked() {
     let mut config = custom_config("");
     config.rules[0].description = "A record for CUST-12345678".into();
     let result = scan_config(temp.path(), config);
-    assert_eq!(result.exit_code, 2);
-    for format in ["terminal", "json", "sarif"] {
+    assert_eq!(result.exit_code, 1);
+    assert!(result.findings[0].description.contains("[REDACTED]"));
+    assert!(
+        result.findings[0].occurrences[0]
+            .path
+            .contains("[REDACTED]")
+    );
+    assert_eq!(result.findings[0].value, "CUST-12345678");
+    for format in ["terminal", "json", "sarif", "markdown", "html"] {
         let text = String::from_utf8(report::render(&result, format, true).unwrap()).unwrap();
-        assert!(!text.contains("CUST-12345678"));
-        assert!(!text.contains('\u{1b}'));
-        assert!(text.contains("[REDACTED]"));
+        // The matched value is now shown (for triage), but the path/description
+        // that happen to also spell it out stay masked. Markdown backslash-escapes
+        // punctuation, so compare with escaping characters stripped out.
+        let unescaped: String = text.chars().filter(|&c| c != '\\').collect();
+        assert!(
+            unescaped.contains("CUST-12345678"),
+            "{format} missing value: {text}"
+        );
+        assert!(!text.contains('\u{1b}'), "{format} has escape byte");
+        assert!(
+            unescaped.contains("[REDACTED]"),
+            "{format} missing redaction marker: {text}"
+        );
     }
 }
 
@@ -1032,13 +1117,29 @@ fn github_adapter_fetches_local_mock_branches_tags_and_default_snapshot() {
                 key.to_str().unwrap(),
                 "--format",
                 "json",
+                "--output",
+                "-",
             ])
             .output()
             .unwrap();
         let report: Value = serde_json::from_slice(&result.stdout).unwrap();
         assert_eq!(result.status.code(), Some(expected), "{report}");
         assert_eq!(report["coverage"]["complete"], true);
-        assert!(!String::from_utf8(result.stdout).unwrap().contains(PASSWORD));
+        if history == "auto" {
+            assert!(report["findings"].as_array().unwrap().iter().any(|f| {
+                f["occurrences"].as_array().unwrap().iter().any(|o| {
+                    o["url"].as_str().is_some_and(|u| {
+                        u.starts_with("https://github.com/synthetic/fixture/blob/")
+                    })
+                })
+            }));
+        }
+        let stdout = String::from_utf8(result.stdout).unwrap();
+        if history == "auto" {
+            assert!(stdout.contains(PASSWORD));
+        } else {
+            assert!(!stdout.contains(PASSWORD));
+        }
     }
 }
 
@@ -1073,6 +1174,8 @@ fn remote_authentication_failures_and_empty_repositories_are_distinct() {
                 key.to_str().unwrap(),
                 "--format",
                 "json",
+                "--output",
+                "-",
             ])
             .output()
             .unwrap();
@@ -1172,6 +1275,8 @@ fn cli_interruption_cancels_git_and_removes_private_workspaces() {
             key.to_str().unwrap(),
             "--format",
             "json",
+            "--output",
+            "-",
             "--timeout-seconds",
             "10",
         ])
@@ -1233,4 +1338,943 @@ fn archive_limits_are_cumulative_across_records_and_include_directories() {
     let mut config = custom_config("");
     config.scan.max_archive_members = 1;
     assert_eq!(scan_config(temp.path(), config).exit_code, 2);
+}
+
+fn stable_report(report: &report::Report) -> Value {
+    let mut value = serde_json::to_value(report).unwrap();
+    value["scan_id"] = Value::Null;
+    // Worker count is part of the effective policy digest by design.
+    value["policy_digest"] = Value::Null;
+    for finding in value["findings"].as_array_mut().unwrap() {
+        finding["scan_id"] = Value::Null;
+    }
+    value
+}
+
+#[test]
+fn parallel_workers_produce_identical_reports_to_single_worker() {
+    let temp = repo();
+    for dir in 0..6 {
+        fs::create_dir_all(temp.path().join(format!("d{dir}"))).unwrap();
+        for file in 0..40 {
+            fs::write(
+                temp.path().join(format!("d{dir}/f{file}.env")),
+                format!("password=synthetic-{dir}-{file}\nCUST-{dir:04}{file:04}\n"),
+            )
+            .unwrap();
+        }
+    }
+    commit(temp.path(), "initial");
+    for file in 0..20 {
+        fs::write(
+            temp.path().join(format!("d0/f{file}.env")),
+            format!("token=synthetic-rotated-{file}\n"),
+        )
+        .unwrap();
+    }
+    commit(temp.path(), "rotate");
+    let mut reports = Vec::new();
+    for workers in [1, 8] {
+        let mut config = custom_config("");
+        config.ruleset.builtins = true;
+        config.scan.workers = workers;
+        let result = scan_config(temp.path(), config);
+        assert_eq!(result.exit_code, 1, "{:?}", result.coverage.entries);
+        reports.push(stable_report(&result));
+    }
+    assert_eq!(reports[0], reports[1]);
+}
+
+#[test]
+fn packed_and_loose_history_are_both_read_through_isolated_storage() {
+    let temp = repo();
+    fs::write(
+        temp.path().join("packed"),
+        format!("password={PASSWORD}-packed"),
+    )
+    .unwrap();
+    commit(temp.path(), "packed");
+    git(temp.path(), &["gc", "--quiet"]);
+    fs::remove_file(temp.path().join("packed")).unwrap();
+    fs::write(
+        temp.path().join("loose"),
+        format!("password={PASSWORD}-loose"),
+    )
+    .unwrap();
+    commit(temp.path(), "loose");
+    fs::remove_file(temp.path().join("loose")).unwrap();
+    commit(temp.path(), "cleanup");
+    let result = scan(temp.path());
+    assert_eq!(result.exit_code, 1, "{:?}", result.coverage.entries);
+    for path in ["packed", "loose"] {
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|f| f.lifecycle == "historical_only"
+                    && f.occurrences.iter().any(|o| o.path == path)),
+            "missing historical {path}"
+        );
+    }
+}
+
+#[test]
+fn loose_object_expansion_is_bounded_by_the_run_budget() {
+    let temp = repo();
+    fs::write(temp.path().join("large"), "0".repeat(64 * 1024)).unwrap();
+    commit(temp.path(), "compressible");
+    let mut config = Config::default();
+    config.scan.max_expanded_bytes_total = 16 * 1024;
+    let result = scan_config(temp.path(), config);
+    assert_eq!(result.exit_code, 2);
+    assert!(
+        result
+            .coverage
+            .entries
+            .iter()
+            .any(|e| e.reason.contains("expanded-byte budget"))
+    );
+}
+
+#[test]
+fn plain_progress_reports_stages_without_paths_or_values() {
+    let temp = TempDir::new().unwrap();
+    let target = temp.path().join("target");
+    fs::create_dir(&target).unwrap();
+    let sensitive_name = "CUST-12345678-name.env";
+    fs::write(target.join(sensitive_name), format!("password={PASSWORD}")).unwrap();
+    let key = cli_key(temp.path());
+    let output = temp.path().join("result.json");
+    let result = Command::new(env!("CARGO_BIN_EXE_secrethunter"))
+        .args([
+            "scan",
+            target.to_str().unwrap(),
+            "--progress",
+            "plain",
+            "--key-file",
+            key.to_str().unwrap(),
+            "--format",
+            "json",
+            "--output",
+        ])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    assert!(stderr.contains("Enumerating files"), "{stderr}");
+    assert!(stderr.contains("scanning 1 objects"), "{stderr}");
+    assert!(stderr.contains("scan complete"), "{stderr}");
+    assert!(stderr.contains("report written to"), "{stderr}");
+    assert!(!stderr.contains(sensitive_name));
+    assert!(!stderr.contains(PASSWORD));
+    let quiet = Command::new(env!("CARGO_BIN_EXE_secrethunter"))
+        .args([
+            "scan",
+            target.to_str().unwrap(),
+            "--progress",
+            "off",
+            "--key-file",
+            key.to_str().unwrap(),
+            "--format",
+            "json",
+            "--output",
+        ])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(quiet.stderr.is_empty());
+}
+
+#[test]
+fn short_values_do_not_garble_scanner_text_or_unrelated_words() {
+    let temp = repo();
+    fs::create_dir(temp.path().join("admin")).unwrap();
+    fs::write(
+        temp.path().join("admin/notes"),
+        "secret=synthetic-notes-value",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("administrator.cfg"),
+        "token=synthetic-unrelated-value",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("app.env"),
+        "password=admin\ntoken=:\nsecret = ::\n",
+    )
+    .unwrap();
+    commit(temp.path(), "initial");
+    let result = scan(temp.path());
+    let text = String::from_utf8(report::render(&result, "terminal", true).unwrap()).unwrap();
+    assert!(text.contains("administrative storage"), "{text}");
+    assert!(!text.contains("[REDACTED]istrat"), "{text}");
+    assert!(!text.contains("scope[REDACTED]"), "{text}");
+    let json = String::from_utf8(report::render(&result, "json", true).unwrap()).unwrap();
+    assert!(json.contains("administrator.cfg"));
+    assert!(
+        json.contains("[REDACTED]/notes"),
+        "standalone short value stays masked"
+    );
+    let identity = Identity::from_bytes(vec![42; 32]).unwrap();
+    for junk in [":", "::"] {
+        let id = identity.fingerprint("secrethunter.secret.v1", &[junk]);
+        assert!(
+            !result.findings.iter().any(|f| f.secret_id == id),
+            "{junk} detected"
+        );
+    }
+    let admin = identity.fingerprint("secrethunter.secret.v1", &["admin"]);
+    assert!(result.findings.iter().any(|f| f.secret_id == admin));
+}
+
+#[test]
+fn long_values_are_masked_even_inside_file_names() {
+    let temp = TempDir::new().unwrap();
+    let token = format!("ghp_{}", "Z".repeat(36));
+    let name = format!("dump{token}backup.txt");
+    fs::write(temp.path().join(&name), &token).unwrap();
+    let result = scan(temp.path());
+    for format in ["terminal", "json", "sarif"] {
+        let text = String::from_utf8(report::render(&result, format, true).unwrap()).unwrap();
+        assert!(text.contains(&token), "{format}");
+        assert!(text.contains("dump[REDACTED]backup.txt"), "{format}");
+    }
+}
+
+/// Minimal class file: Utf8 constants (one using modified-UTF-8 NUL), a Long that
+/// occupies two pool slots, and a Class reference, followed by class metadata.
+fn class_file(secret: &str) -> (Vec<u8>, usize) {
+    let mut out = vec![0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 61, 0, 6];
+    let push_utf8 = |out: &mut Vec<u8>, data: &[u8]| {
+        out.push(1);
+        out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        out.extend_from_slice(data);
+    };
+    push_utf8(&mut out, b"com/example/Config");
+    out.push(5);
+    out.extend_from_slice(&42u64.to_be_bytes());
+    let mut literal = b"key\xc0\x80".to_vec();
+    literal.extend_from_slice(secret.as_bytes());
+    out.push(1);
+    out.extend_from_slice(&(literal.len() as u16).to_be_bytes());
+    let secret_offset = out.len() + 5;
+    out.extend_from_slice(&literal);
+    out.extend_from_slice(&[7, 0, 1]);
+    out.extend_from_slice(&[0, 0x21, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    (out, secret_offset)
+}
+
+#[test]
+fn java_class_constants_are_fully_inspected_inside_jars() {
+    let temp = TempDir::new().unwrap();
+    let secret = "CUST-12345678";
+    let (class, offset) = class_file(secret);
+    fs::create_dir(temp.path().join("target")).unwrap();
+    write_zip(
+        &temp.path().join("target/app.jar"),
+        &[
+            ("com/example/Config.class", &class),
+            ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n"),
+        ],
+    );
+    let result = scan_config(temp.path(), custom_config(""));
+    assert!(result.coverage.complete, "{:?}", result.coverage.entries);
+    assert_eq!(result.exit_code, 1);
+    let occurrence = &result.findings[0].occurrences[0];
+    assert_eq!(occurrence.extraction_chain, ["zip", "java-class"]);
+    assert_eq!(occurrence.location_mapping, "class_constant_bytes");
+    assert_eq!(occurrence.byte_start, offset);
+    assert_eq!(occurrence.byte_end, offset + secret.len());
+    assert_eq!(occurrence.line_start, None);
+
+    let mut universal = vec![0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2];
+    universal.extend_from_slice(b"\0CUST-87654321\0");
+    fs::write(temp.path().join("tool"), universal).unwrap();
+    let result = scan_config(temp.path(), custom_config(""));
+    assert_eq!(result.exit_code, 1, "readable strings are still inspected");
+    let mut strict = custom_config("");
+    strict.scan.strict_coverage = true;
+    assert_eq!(
+        scan_config(temp.path(), strict).exit_code,
+        2,
+        "Mach-O universal binaries are strings-only coverage"
+    );
+}
+
+#[test]
+fn terminal_report_groups_coverage_and_cli_exclusions_resolve_it() {
+    let temp = TempDir::new().unwrap();
+    let target = temp.path().join("target");
+    fs::create_dir_all(target.join("build")).unwrap();
+    for index in 0..10 {
+        fs::write(
+            target.join(format!("build/blob{index}.bin")),
+            b"\0\x01binary",
+        )
+        .unwrap();
+    }
+    fs::write(target.join("app.env"), format!("password={PASSWORD}")).unwrap();
+    let key = cli_key(temp.path());
+    let run = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_secrethunter"))
+            .args([
+                "scan",
+                target.to_str().unwrap(),
+                "--progress",
+                "off",
+                "--format",
+                "terminal",
+                "--key-file",
+            ])
+            .arg(&key)
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let result = run(&[]);
+    assert_eq!(result.status.code(), Some(1), "works without configuration");
+    let text = String::from_utf8(result.stdout).unwrap();
+    assert!(text.contains("cannot be. (10)"), "{text}");
+    assert!(text.contains("... and 7 more"), "{text}");
+    assert!(text.contains("Result: exit 1"), "{text}");
+    assert!(
+        text.contains("generic-secret"),
+        "findings remain visible: {text}"
+    );
+    assert!(text.contains(PASSWORD));
+    let result = run(&["--strict-coverage"]);
+    assert_eq!(result.status.code(), Some(2));
+    let text = String::from_utf8(result.stdout).unwrap();
+    assert!(text.contains("Result: exit 2"), "{text}");
+    assert!(text.contains("--exclude"), "{text}");
+    let result = run(&["--exclude", "build/**"]);
+    assert_eq!(result.status.code(), Some(1));
+    let text = String::from_utf8(result.stdout).unwrap();
+    assert!(text.contains("Result: exit 1"), "{text}");
+    assert!(text.contains("excluded 10: build/**"), "{text}");
+}
+
+#[test]
+fn decoded_noise_is_not_reported_as_binary() {
+    use base64::Engine;
+    let temp = repo();
+    let noise =
+        base64::engine::general_purpose::STANDARD.encode(b"\x01\x02\x03\x04\x05\x06\x07abcdefgh");
+    fs::write(temp.path().join("notes.txt"), format!("branch {noise}\n")).unwrap();
+    commit(temp.path(), &format!("Merge branch feature/{noise}"));
+    let result = scan(temp.path());
+    assert_eq!(result.exit_code, 0, "{:?}", result.coverage.entries);
+    assert!(
+        !result
+            .coverage
+            .entries
+            .iter()
+            .any(|e| e.reason == secrethunter::extract::BINARY_STRINGS),
+        "{:?}",
+        result.coverage.entries
+    );
+}
+
+#[test]
+fn legacy_encoded_text_and_utf16_binary_strings_are_inspected() {
+    let temp = repo();
+    fs::write(
+        temp.path().join("latin1.properties"),
+        b"# caf\xe9 settings\npassword=synthetic-latin1-value\n",
+    )
+    .unwrap();
+    let mut wide = vec![0u8, 1, 2, 3];
+    let prefix = wide.len();
+    for unit in "password=synthetic-wide-value".encode_utf16() {
+        wide.extend_from_slice(&unit.to_le_bytes());
+    }
+    wide.extend_from_slice(&[0, 0, 0xff]);
+    fs::write(temp.path().join("app.dll"), &wide).unwrap();
+    git(temp.path(), &["add", "--all"]);
+    git(
+        temp.path(),
+        &[
+            "-c",
+            "i18n.commitEncoding=ISO-8859-1",
+            "commit",
+            "-m",
+            "init",
+        ],
+    );
+    let result = scan(temp.path());
+    assert_eq!(result.exit_code, 1, "{:?}", result.coverage.entries);
+    let occurrences: Vec<_> = result
+        .findings
+        .iter()
+        .flat_map(|f| &f.occurrences)
+        .collect();
+    let latin = occurrences
+        .iter()
+        .find(|o| o.path == "latin1.properties" && o.source == "working_tree")
+        .unwrap();
+    assert_eq!(latin.extraction_chain, ["latin1"]);
+    assert_eq!(latin.line_start, Some(2));
+    let binary = occurrences
+        .iter()
+        .find(|o| o.path == "app.dll" && o.source == "working_tree")
+        .unwrap();
+    assert_eq!(binary.extraction_chain, ["binary-strings"]);
+    assert_eq!(binary.byte_start, prefix + 2 * "password=".len());
+    assert_eq!(binary.byte_end, wide.len() - 3);
+}
+
+#[test]
+fn github_remote_urls_are_validated_and_canonicalized() {
+    use secrethunter::links::github_base;
+    for (remote, expected) in [
+        (
+            "https://github.com/acme/app.git",
+            Some("https://github.com/acme/app"),
+        ),
+        (
+            "https://user:token@github.com/acme/app",
+            Some("https://github.com/acme/app"),
+        ),
+        (
+            "git@github.com:acme/app.git",
+            Some("https://github.com/acme/app"),
+        ),
+        (
+            "ssh://git@github.com/acme/app.git",
+            Some("https://github.com/acme/app"),
+        ),
+        ("https://github.com.evil.example/acme/app", None),
+        ("https://evil.example/github.com/acme/app", None),
+        ("git@github.com:acme/app/extra", None),
+        ("https://github.com/acme/a%22pp", None),
+        ("file:///tmp/github.com/acme/app", None),
+    ] {
+        assert_eq!(github_base(remote).as_deref(), expected, "{remote}");
+    }
+}
+
+#[test]
+fn html_and_markdown_reports_link_to_github_and_escape_target_text() {
+    let temp = repo();
+    git(
+        temp.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:example-org/example-repo.git",
+        ],
+    );
+    fs::create_dir(temp.path().join("docs")).unwrap();
+    let name = "x<b>&\"evil\".env";
+    fs::write(temp.path().join(name), format!("password={PASSWORD}\n")).unwrap();
+    fs::write(
+        temp.path().join("docs/guide.md"),
+        "token=synthetic-doc-token\n",
+    )
+    .unwrap();
+    let first = commit(temp.path(), "add config");
+    fs::write(
+        temp.path().join("untracked.env"),
+        "secret=synthetic-untracked\n",
+    )
+    .unwrap();
+    let result = scan(temp.path());
+    assert_eq!(result.exit_code, 1);
+    let base = "https://github.com/example-org/example-repo";
+    assert_eq!(result.repository_url.as_deref(), Some(base));
+    let occurrences: Vec<_> = result
+        .findings
+        .iter()
+        .flat_map(|f| &f.occurrences)
+        .collect();
+    let historical = occurrences
+        .iter()
+        .find(|o| o.path == "docs/guide.md" && o.source == "git_history")
+        .unwrap();
+    assert_eq!(
+        historical.url.as_deref(),
+        Some(format!("{base}/blob/{first}/docs/guide.md?plain=1#L1").as_str())
+    );
+    let message = occurrences
+        .iter()
+        .find(|o| o.path == name && o.source == "working_tree")
+        .unwrap();
+    assert_eq!(
+        message.url.as_deref(),
+        Some(format!("{base}/blob/{first}/x%3Cb%3E%26%22evil%22.env#L1").as_str())
+    );
+    assert!(message.file_url.as_deref().unwrap().starts_with("file:///"));
+    let untracked = occurrences
+        .iter()
+        .find(|o| o.path == "untracked.env")
+        .unwrap();
+    assert!(
+        untracked.url.is_none(),
+        "untracked files have no GitHub page"
+    );
+    assert!(untracked.file_url.is_some());
+
+    let html = String::from_utf8(report::render(&result, "html", false).unwrap()).unwrap();
+    assert!(html.starts_with("<!doctype html>"));
+    assert!(html.contains(&format!("href=\"{base}/commit/{first}\"")));
+    assert!(html.contains("x&lt;b&gt;&amp;&quot;evil&quot;.env"));
+    assert!(!html.contains("x<b>"));
+    assert!(html.contains(PASSWORD));
+    assert!(html.contains("Content-Security-Policy"));
+    let markdown = String::from_utf8(report::render(&result, "markdown", false).unwrap()).unwrap();
+    assert!(markdown.contains(&format!("({base}/commit/{first})")));
+    assert!(markdown.contains("x\\<b\\>\\&\"evil\"\\.env"));
+    assert!(markdown.contains(PASSWORD));
+}
+
+#[test]
+fn links_are_dropped_when_their_path_contains_a_redacted_value() {
+    let temp = repo();
+    git(
+        temp.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example-org/example-repo",
+        ],
+    );
+    fs::create_dir(temp.path().join("exports")).unwrap();
+    fs::write(
+        temp.path().join("exports/CUST-12345678 copy.txt"),
+        "CUST-12345678",
+    )
+    .unwrap();
+    commit(temp.path(), "export");
+    let result = scan_config(temp.path(), custom_config(""));
+    let occurrences: Vec<_> = result
+        .findings
+        .iter()
+        .flat_map(|f| &f.occurrences)
+        .collect();
+    assert!(!occurrences.is_empty());
+    for occurrence in occurrences {
+        assert!(occurrence.path.contains("[REDACTED]"));
+        assert!(occurrence.url.is_none() && occurrence.file_url.is_none());
+    }
+    for format in ["json", "html", "markdown"] {
+        let text = String::from_utf8(report::render(&result, format, false).unwrap()).unwrap();
+        let unescaped: String = text.chars().filter(|&c| c != '\\').collect();
+        // The path stays masked (and is never linked), but the matched value is
+        // now shown elsewhere in the report (e.g. the finding's value field).
+        assert!(unescaped.contains("CUST-12345678"), "{format}");
+        assert!(!text.contains("CUST-12345678%20"), "{format}");
+    }
+}
+
+#[test]
+fn commit_messages_with_legacy_encodings_or_escapes_are_text() {
+    for message in [
+        b"Caf\xe9 fix for d\xe9ploiement\n".as_slice(),
+        b"Fix \x1b[31mcolored\x1b[0m \x02 output\n".as_slice(),
+    ] {
+        let temp = repo();
+        fs::write(temp.path().join("README"), "readme").unwrap();
+        fs::write(temp.path().join(".git/msg"), message).unwrap();
+        git(temp.path(), &["add", "README"]);
+        git(temp.path(), &["commit", "-F", ".git/msg"]);
+        let result = scan(temp.path());
+        assert_eq!(result.exit_code, 0, "{:?}", result.coverage.entries);
+        assert!(
+            !result
+                .coverage
+                .entries
+                .iter()
+                .any(|e| e.reason == secrethunter::extract::BINARY_STRINGS),
+            "{:?}",
+            result.coverage.entries
+        );
+    }
+}
+
+#[test]
+fn sensitivity_scale_filters_low_entropy_generic_secrets_but_not_signatures() {
+    use secrethunter::detect::{entropy, sensitivity_floor};
+    let low_value = "aaaaaaaaaaaa";
+    assert!(
+        entropy(low_value) < sensitivity_floor(0),
+        "fixture must be low-entropy enough to be filtered at sensitivity 0"
+    );
+    assert!(
+        entropy(PASSWORD) >= sensitivity_floor(10),
+        "fixture must still match at maximum sensitivity"
+    );
+
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("config.env"),
+        format!("password={low_value}\n"),
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("aws.env"),
+        "AWS_KEY=AKIAABCDEFGHIJKLMNOP\n",
+    )
+    .unwrap();
+
+    let mut strict = Config::default();
+    strict.scan.sensitivity = 0;
+    let result = scan_config(temp.path(), strict);
+    assert!(
+        !result
+            .findings
+            .iter()
+            .any(|f| f.rule_id.starts_with("generic-secret")),
+        "low-entropy placeholder should be filtered at sensitivity 0: {:?}",
+        result.findings
+    );
+    assert!(
+        result
+            .findings
+            .iter()
+            .any(|f| f.rule_id == "aws-access-key"),
+        "provider signatures must be unaffected by sensitivity"
+    );
+
+    let mut lenient = Config::default();
+    lenient.scan.sensitivity = 10;
+    let result = scan_config(temp.path(), lenient);
+    assert!(
+        result
+            .findings
+            .iter()
+            .any(|f| f.rule_id.starts_with("generic-secret")),
+        "sensitivity 10 must restore full detection"
+    );
+}
+
+#[test]
+fn sensitivity_out_of_range_is_rejected_by_policy_validation() {
+    let mut config = Config::default();
+    config.scan.sensitivity = 11;
+    assert!(config::validate(&config, true).is_err());
+}
+
+#[test]
+fn cli_rejects_out_of_range_sensitivity() {
+    let temp = TempDir::new().unwrap();
+    let key = cli_key(temp.path());
+    let result = Command::new(env!("CARGO_BIN_EXE_secrethunter"))
+        .args([
+            "scan",
+            temp.path().to_str().unwrap(),
+            "--sensitivity",
+            "11",
+            "--key-file",
+            key.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+}
+
+#[test]
+fn default_output_is_a_named_html_file_in_the_current_directory() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("secret.env"),
+        format!("password={PASSWORD}\n"),
+    )
+    .unwrap();
+    let key = cli_key(temp.path());
+    let result = Command::new(env!("CARGO_BIN_EXE_secrethunter"))
+        .current_dir(temp.path())
+        .args(["scan", ".", "--key-file", key.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(
+        result.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(result.stdout.is_empty());
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    assert!(stderr.contains("report written to"), "{stderr}");
+    let produced: Vec<_> = fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("SecretHunter-") && name.ends_with(".html"))
+        .collect();
+    assert_eq!(produced.len(), 1, "{:?}", produced);
+    let html = fs::read_to_string(temp.path().join(&produced[0])).unwrap();
+    assert!(html.starts_with("<!doctype html>"));
+    assert!(html.contains("id=\"sh-search\""));
+    assert!(html.contains("class=\"finding searchable"));
+    assert!(html.contains(PASSWORD));
+}
+
+#[test]
+fn llm_verify_flags_are_non_interactive_and_never_block_the_scan() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("secret.env"),
+        format!("password={PASSWORD}\n"),
+    )
+    .unwrap();
+    let key = cli_key(temp.path());
+
+    // No flags at all: without a TTY, LLM verification is never attempted
+    // and the scan completes and writes a report as usual.
+    let result = Command::new(env!("CARGO_BIN_EXE_secrethunter"))
+        .current_dir(temp.path())
+        .args([
+            "scan",
+            ".",
+            "--key-file",
+            key.to_str().unwrap(),
+            "--format",
+            "json",
+            "--output",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert!(report["findings"][0]["llm"].is_null());
+
+    // --no-llm-verify explicitly skips, same outcome.
+    let result = Command::new(env!("CARGO_BIN_EXE_secrethunter"))
+        .current_dir(temp.path())
+        .args([
+            "scan",
+            ".",
+            "--key-file",
+            key.to_str().unwrap(),
+            "--no-llm-verify",
+            "--format",
+            "json",
+            "--output",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(1));
+
+    // --llm-verify with an unreachable endpoint skips with a warning instead
+    // of failing the scan or blocking on a prompt.
+    let result = Command::new(env!("CARGO_BIN_EXE_secrethunter"))
+        .current_dir(temp.path())
+        .args([
+            "scan",
+            ".",
+            "--key-file",
+            key.to_str().unwrap(),
+            "--llm-verify",
+            "--llm-model",
+            "fixture-model",
+            "--llm-endpoint",
+            "http://127.0.0.1:1",
+            "--format",
+            "json",
+            "--output",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    assert!(stderr.contains("skipping LLM verification"), "{stderr}");
+    let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert!(report["findings"][0]["llm"].is_null());
+
+    // --llm-model without --llm-verify is rejected by clap up front.
+    let result = Command::new(env!("CARGO_BIN_EXE_secrethunter"))
+        .current_dir(temp.path())
+        .args([
+            "scan",
+            ".",
+            "--key-file",
+            key.to_str().unwrap(),
+            "--llm-model",
+            "fixture-model",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+}
+
+#[test]
+fn output_dash_forces_stdout_regardless_of_default_format() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("secret.env"),
+        format!("password={PASSWORD}\n"),
+    )
+    .unwrap();
+    let key = cli_key(temp.path());
+    let result = Command::new(env!("CARGO_BIN_EXE_secrethunter"))
+        .current_dir(temp.path())
+        .args([
+            "scan",
+            ".",
+            "--key-file",
+            key.to_str().unwrap(),
+            "--output",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    assert!(stdout.starts_with("<!doctype html>"));
+    assert!(
+        fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .all(|e| !e.file_name().to_string_lossy().starts_with("SecretHunter-"))
+    );
+}
+
+#[test]
+fn terminal_format_without_output_still_defaults_to_stdout() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("secret.env"),
+        format!("password={PASSWORD}\n"),
+    )
+    .unwrap();
+    let key = cli_key(temp.path());
+    let result = Command::new(env!("CARGO_BIN_EXE_secrethunter"))
+        .current_dir(temp.path())
+        .args([
+            "scan",
+            ".",
+            "--format",
+            "terminal",
+            "--progress",
+            "off",
+            "--key-file",
+            key.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    assert!(
+        String::from_utf8(result.stdout)
+            .unwrap()
+            .contains("Result: exit 1")
+    );
+    assert!(
+        fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .all(|e| !e.file_name().to_string_lossy().starts_with("SecretHunter-"))
+    );
+}
+
+#[test]
+fn html_report_is_searchable_with_collapsed_sections_and_a_summary() {
+    let temp = repo();
+    fs::write(
+        temp.path().join("secret.env"),
+        format!("password={PASSWORD}\n"),
+    )
+    .unwrap();
+    commit(temp.path(), "add secret");
+    let result = scan(temp.path());
+    let html = String::from_utf8(report::render(&result, "html", false).unwrap()).unwrap();
+    assert!(html.contains("id=\"sh-search\""));
+    assert!(html.contains("id=\"sh-expand\""));
+    assert!(html.contains("id=\"sh-collapse\""));
+    assert!(html.contains("<details class=\"section\" id=\"findings-section\">"));
+    assert!(!html.contains("<details class=\"section\" id=\"findings-section\" open"));
+    assert!(html.contains("class=\"finding searchable"));
+    assert!(html.contains("At a glance"));
+    assert!(html.contains(&format!(
+        "<span class=\"n\">{}</span>",
+        result.findings.len()
+    )));
+    assert!(html.contains("script-src 'unsafe-inline'"));
+    assert!(html.contains("<script>"));
+}
+
+#[test]
+fn oversized_working_tree_files_are_a_default_limitation_not_a_hard_failure() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("small.env"),
+        format!("password={PASSWORD}\n"),
+    )
+    .unwrap();
+    fs::write(temp.path().join("huge.bin"), vec![b'a'; 10_000]).unwrap();
+    let mut config = Config::default();
+    config.scan.max_file_bytes = 100;
+    let result = scan_config(temp.path(), config);
+    assert_eq!(
+        result.exit_code, 1,
+        "a single oversized build artifact must not force incomplete coverage by default: {:?}",
+        result.coverage.entries
+    );
+    assert!(result.coverage.complete);
+    assert!(
+        result
+            .coverage
+            .entries
+            .iter()
+            .any(|e| e.status == "limitation" && e.reason == "Record exceeds file-byte limit.")
+    );
+    assert_eq!(result.max_file_bytes, 100);
+
+    let mut strict = Config::default();
+    strict.scan.max_file_bytes = 100;
+    strict.scan.strict_coverage = true;
+    let result = scan_config(temp.path(), strict);
+    assert_eq!(result.exit_code, 2);
+    assert!(!result.coverage.complete);
+    assert!(
+        result
+            .coverage
+            .entries
+            .iter()
+            .any(|e| e.status == "incomplete" && e.reason == "Record exceeds file-byte limit.")
+    );
+}
+
+#[test]
+fn oversized_historical_blobs_are_a_default_limitation_not_a_hard_failure() {
+    let temp = repo();
+    fs::write(
+        temp.path().join("small.env"),
+        format!("password={PASSWORD}\n"),
+    )
+    .unwrap();
+    fs::write(temp.path().join("huge.bin"), vec![b'a'; 10_000]).unwrap();
+    commit(temp.path(), "initial");
+    let mut config = Config::default();
+    config.scan.max_file_bytes = 100;
+    let result = scan_config(temp.path(), config);
+    assert_eq!(result.exit_code, 1, "{:?}", result.coverage.entries);
+    assert!(result.coverage.complete);
+    assert!(result.coverage.entries.iter().any(
+        |e| e.status == "limitation" && e.reason == "Historical blob exceeds file-byte limit."
+    ));
+}
+
+#[test]
+fn terminal_report_hints_about_oversized_skips_with_the_configured_limit() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("small.env"),
+        format!("password={PASSWORD}\n"),
+    )
+    .unwrap();
+    fs::write(temp.path().join("huge.bin"), vec![b'a'; 10_000]).unwrap();
+    let mut config = Config::default();
+    config.scan.max_file_bytes = 100;
+    let result = scan_config(temp.path(), config);
+    let text = String::from_utf8(report::render(&result, "terminal", true).unwrap()).unwrap();
+    assert!(text.contains("exceed max_file_bytes"), "{text}");
+    assert!(text.contains("--max-file-bytes"), "{text}");
+    assert!(text.contains("100 B"), "{text}");
 }

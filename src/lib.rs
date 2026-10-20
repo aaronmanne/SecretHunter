@@ -5,8 +5,13 @@ compile_error!("SecretHunter currently supports macOS and Linux only.");
 
 pub mod config;
 pub mod detect;
+pub mod document;
 pub mod extract;
 pub mod finding;
+pub mod interactive;
+pub mod links;
+pub mod llm;
+pub mod progress;
 pub mod report;
 pub mod scan;
 pub mod source;

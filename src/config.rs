@@ -48,6 +48,14 @@ pub struct ScanConfig {
     pub timeout_seconds: u64,
     pub max_records: usize,
     pub max_findings: usize,
+    /// Treat format limitations (binary strings-only inspection, encrypted archive
+    /// members, office containers) as incomplete coverage (exit 2).
+    pub strict_coverage: bool,
+    /// Detection sensitivity, 0 (fewest/highest-confidence findings) to 10 (most
+    /// findings, including low-entropy or placeholder-looking values). Mainly
+    /// scales a minimum-entropy requirement applied to generic assignment and
+    /// connection-string rules; provider-specific signatures are unaffected.
+    pub sensitivity: u8,
 }
 
 impl Default for ScanConfig {
@@ -56,8 +64,8 @@ impl Default for ScanConfig {
             history: "auto".into(),
             respect_gitignore: false,
             follow_symlinks: false,
-            workers: 4,
-            max_file_bytes: 20 * 1024 * 1024,
+            workers: std::thread::available_parallelism().map_or(4, |n| n.get().clamp(1, 16)),
+            max_file_bytes: 100 * 1024 * 1024,
             max_archive_depth: 2,
             max_decode_depth: 2,
             max_expanded_bytes_per_record: 100 * 1024 * 1024,
@@ -66,6 +74,8 @@ impl Default for ScanConfig {
             timeout_seconds: 600,
             max_records: 1_000_000,
             max_findings: 100_000,
+            strict_coverage: false,
+            sensitivity: 5,
         }
     }
 }
@@ -147,7 +157,7 @@ pub struct Output {
 impl Default for Output {
     fn default() -> Self {
         Self {
-            format: "terminal".into(),
+            format: "html".into(),
             redact: true,
             include_context: false,
         }
@@ -193,6 +203,8 @@ pub struct Suppression {
     pub ticket: String,
     pub expires: String,
 }
+
+pub const FORMATS: [&str; 5] = ["terminal", "json", "markdown", "html", "sarif"];
 
 pub fn severity_rank(value: &str) -> Option<u8> {
     match value {
@@ -262,13 +274,14 @@ pub fn validate(config: &Config, strict_expiry: bool) -> Result<(), String> {
         || s.timeout_seconds > 86_400
         || s.max_records == 0
         || !(1..=1_000_000).contains(&s.max_findings)
+        || s.sensitivity > 10
     {
-        return Err("Invalid resource limit (workers 1..64, file size 1..256 MiB, depths 0..8, timeout 1..86400).".into());
+        return Err("Invalid resource limit (workers 1..64, file size 1..256 MiB, depths 0..8, timeout 1..86400, sensitivity 0..10).".into());
     }
     if config.verification.mode != "offline" {
         return Err("Only offline verification is supported.".into());
     }
-    if !["terminal", "json", "sarif"].contains(&config.output.format.as_str()) {
+    if !FORMATS.contains(&config.output.format.as_str()) {
         return Err("Invalid output format.".into());
     }
     if !config.output.redact || config.output.include_context {

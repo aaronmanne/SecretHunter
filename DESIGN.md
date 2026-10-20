@@ -23,7 +23,8 @@ promise that a clean scan proves the absence of secrets.
 - Find low-entropy passwords and sensitive records, not only random-looking tokens.
 - Preserve evidence of historical exposure even after deletion from the current tree.
 - Work locally without transmitting discovered values by default.
-- Support investigation and CI through consistent terminal, JSON, and SARIF output.
+- Support investigation and CI through consistent terminal, JSON, Markdown, HTML,
+  and SARIF output, with links to GitHub commits and files where available.
 
 ### Non-Goals
 
@@ -116,7 +117,7 @@ commit messages and annotated tag messages are scanned as separate source record
 ```sh
 secrethunter scan ./service
 secrethunter scan https://github.com/example/service.git
-secrethunter scan ./service --history off --format json --output findings.json
+secrethunter scan ./service --history off --format json --output -
 secrethunter scan ./service --config ./security/secrethunter.toml
 secrethunter scan ./service --audit-ignores --format sarif --output findings.sarif
 secrethunter config validate --config ./security/secrethunter.toml
@@ -124,7 +125,10 @@ secrethunter rules test --config ./security/secrethunter.toml
 ```
 
 One target per invocation initially. Progress and diagnostics go to stderr;
-machine-readable results go to stdout or an explicit output path. Cancellation
+machine-readable results go to stdout or an explicit output path. The default
+report format is a single self-contained, searchable HTML page with collapsible
+findings/coverage sections, written to `./SecretHunter-<timestamp>.html` when no
+output path is given; `--output -` forces stdout for any format. Cancellation
 preserves a partial report when possible, marks it incomplete, and cleans up clones.
 Create outputs outside the scan target, or explicitly exclude the active output
 file so the scanner never scans its own report. Write reports atomically with
@@ -139,8 +143,20 @@ restrictive permissions.
 
 Errors/incomplete coverage take precedence over finding exit codes. Explicit
 exclusions do not make a run incomplete, but remain visible in the coverage report.
-Known format limitations also appear in that report; encountered unsupported
-content, read failures, and exhausted limits make requested coverage incomplete.
+Read failures, missing objects, and exhausted resource/time limits make requested
+coverage incomplete. Known format limitations (binary content inspected only
+through readable strings, encrypted or unsupported-compression archive members,
+office containers, archive link entries, and files or objects exceeding the
+configured size limit) are always listed in the coverage report but, so the
+scanner works without configuration, only affect the exit code in an opt-in
+strict-coverage mode.
+
+A `--sensitivity` dial (0-10, default 5) tunes a minimum-entropy requirement on the
+broad assignment-style rules (`password=`/`token=`-shaped matches and
+connection-string passwords) to trade detection breadth against false positives,
+without affecting provider-specific signature rules. `--help` documents every
+flag with its default and worked examples; it is treated as user-facing
+documentation, not an afterthought.
 
 ## 5. Architecture
 
@@ -166,7 +182,8 @@ All stages -> coverage ledger + structured diagnostics
 - `detect`: built-in/custom rules, keyword indexing, bounded context, local validators.
 - `policy`: trusted configuration, excludes, suppressions, baselines, CI thresholds.
 - `finding`: evidence, secret identity, exposure occurrences, lifecycle comparison.
-- `report`: terminal, JSON schema, SARIF 2.1.0, and coverage summaries.
+- `report`: terminal, JSON schema, Markdown, self-contained HTML, SARIF 2.1.0, and
+  coverage summaries.
 
 Use proven Git, parsing, and archive libraries/tools rather than implementing
 their formats. Keep interfaces small: a source emits records with origin metadata;
@@ -215,8 +232,12 @@ whole-record pass. If that pass exceeds limits, mark coverage incomplete rather
 than silently missing multiline keys. Decoder/archiver budgets apply cumulatively
 across each source record and the whole run, not independently per nested child.
 
-Initial unsupported binary formats receive bounded printable-string inspection,
-but this is explicitly partial coverage, not equivalent to document extraction.
+Binary formats without a dedicated extractor receive bounded readable-string
+extraction (printable ASCII/UTF-8 and UTF-16LE runs, mapped to original byte
+offsets). This is recorded as a format limitation, not equivalent to document
+extraction. Java class files are a supported format: their constant-pool strings
+are decoded completely. Text containing legacy-encoded bytes is inspected as text,
+and decoded candidates are only inspected further when they decode to readable text.
 
 ### Verification
 
@@ -287,7 +308,7 @@ history = "auto"
 respect_gitignore = false
 follow_symlinks = false
 workers = 4
-max_file_bytes = 20971520
+max_file_bytes = 104857600
 max_archive_depth = 2
 max_decode_depth = 2
 max_expanded_bytes_per_record = 104857600
@@ -445,6 +466,14 @@ message bodies. If context reporting is enabled, mask the entire matched span an
 all detected sensitive spans before rendering; omit context if safe redaction
 cannot be established. Never expose value prefixes/suffixes as a default mask.
 
+> **Deviation (approved):** to let reviewers tell real secrets from false
+> positives without re-opening the source, every report format shows each
+> finding's actual matched value (`finding.value`) instead of `[REDACTED]`. This
+> is the only field exempted from masking — paths, descriptions, coverage
+> reasons, and everything else above are still redacted exactly as specified.
+> Every report carries a visible warning that it contains raw matched values and
+> must be handled as sensitively as the secrets themselves.
+
 Compute secret identity with domain-separated HMAC-SHA-256 of the exact extracted
 value and a privately stored random installation key. Do not use unsalted hashes
 for low-entropy personal data. Persistent comparison requires the same key and
@@ -486,7 +515,12 @@ scan is not proof a credential was revoked or sensitive data was contained.
   absolute names, symlink members, and compression bombs; cap members, depth,
   expanded bytes, candidate lengths, memory, and wall time. Record all limits hit.
 - Escape control characters in terminal output and filenames; sanitize JSON/SARIF
-  fields and disable report links to untrusted destinations.
+  fields, HTML-escape and Markdown-escape all target text, and only emit report
+  links built from trusted components: the fixed `https://github.com` host with
+  validated owner/repository names, hexadecimal object IDs, and percent-encoded
+  paths, or `file://` links under the operator's scan root. Omit a link whenever
+  masking altered the path it encodes. HTML reports load no scripts or external
+  resources.
 - No telemetry, external model calls, online verification, or update checks during
   scans by default. Acquisition uses network access only for the requested source.
 - Do not persist raw secrets. Protect reports and fingerprints as sensitive metadata;
